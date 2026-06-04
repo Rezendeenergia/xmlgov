@@ -89,6 +89,25 @@ def identificar_estabelecimento(cnpj: str) -> str:
     return "Matriz" if seq == "0001" else f"Filial {seq}"
 
 
+def cnpj_emitente_da_chave(chave: str) -> str:
+    """Extrai os 14 digitos do CNPJ emitente da chave NFS-e Padrao Nacional.
+
+    Estrutura da chave (50 caracteres):
+      pos  1-7:  Codigo IBGE do municipio
+      pos  8-9:  Ano (AA)
+      pos 10-11: Mes (MM)
+      pos 12:    Tipo
+      pos 13-26: CNPJ ou CPF do emitente (14 digitos)
+      pos 27-32: Serie
+      pos 33-47: Numero
+      pos 48-50: Codigo numerico
+    """
+    chave = re.sub(r"\D", "", chave or "")
+    if len(chave) != 50:
+        return ""
+    return chave[12:26]
+
+
 # ============================================================================
 # GERENCIADOR DE CERTIFICADOS
 # ============================================================================
@@ -199,9 +218,17 @@ def parse_nfse_xml(xml_bytes: bytes) -> dict:
     chave = ""
     inf = find(root, ".//nfse:infNFSe")
     if inf is not None:
-        chave = (inf.get("Id") or "").replace("NFSe", "")
+        chave = inf.get("Id") or ""
     if not chave:
         chave = text(root, ".//nfse:chNFSe")
+
+    # Normaliza a chave: remove qualquer prefixo de letras (NFS, NFSe, Id, etc.)
+    # e garante exatamente 50 digitos numericos.
+    chave = re.sub(r"\D", "", chave)
+    if len(chave) > 50:
+        chave = chave[-50:]
+    if len(chave) != 50:
+        chave = ""
 
     numero = text(root, ".//nfse:nNFSe")
     data_emissao_raw = text(root, ".//nfse:dhEmi") or text(root, ".//nfse:DataEmissao")
@@ -374,25 +401,73 @@ class NFSeNacionalClient:
                 })
         return {"LoteDFe": docs}
 
-    def baixar_danfse(self, chave_acesso: str) -> Optional[bytes]:
+    def baixar_danfse(self, chave_acesso: str, log_cb=None,
+                      max_retries: int = 4) -> Optional[bytes]:
         """Baixa o DANFSe (PDF) oficial via endpoint ADN.
 
-        Endpoint oficial: /danfse/{chave}
+        Endpoint oficial: GET /danfse/{chave}
         Documentacao: https://adn.nfse.gov.br/danfse/docs/index.html
+
+        Implementa retry com backoff exponencial para HTTP 429 (rate limit):
+        - 1a falha: espera 5s
+        - 2a falha: espera 10s
+        - 3a falha: espera 20s
+        - 4a falha: espera 40s
+        Respeita header Retry-After se presente.
         """
         candidatas = [
             f"{self.adn_base}/danfse/{chave_acesso}",
             f"{self.adn_base}/danfse/NFSe/{chave_acesso}",
             f"{self.adn_base}/contribuintes/DANFSe/{chave_acesso}",
         ]
+        ultimo_erro = ""
+
         for url in candidatas:
-            try:
-                r = self.session.get(url, timeout=30,
-                                     headers={"Accept": "application/pdf"})
-                if r.status_code == 200 and r.content[:4] == b"%PDF":
-                    return r.content
-            except requests.RequestException:
-                continue
+            for tentativa in range(max_retries):
+                try:
+                    r = self.session.get(
+                        url, timeout=60,
+                        headers={"Accept": "application/pdf"},
+                    )
+
+                    # Sucesso: PDF valido
+                    if r.status_code == 200 and r.content[:4] == b"%PDF":
+                        return r.content
+
+                    # Rate limit: backoff exponencial e retry na mesma URL
+                    if r.status_code == 429:
+                        retry_after = r.headers.get("Retry-After", "")
+                        if retry_after.isdigit():
+                            espera = int(retry_after)
+                        else:
+                            espera = min(60, 5 * (2 ** tentativa))  # 5,10,20,40
+
+                        if log_cb:
+                            log_cb(f"    [PDF] HTTP 429 (rate limit). "
+                                   f"Aguardando {espera}s e tentando de novo "
+                                   f"(tentativa {tentativa + 1}/{max_retries})...")
+                        time.sleep(espera)
+                        continue  # tenta a mesma URL novamente
+
+                    # Sucesso parcial: 200 mas nao e PDF
+                    if r.status_code == 200:
+                        ultimo_erro = (
+                            f"200 mas nao retornou PDF. Content-Type: "
+                            f"{r.headers.get('Content-Type', '?')}, "
+                            f"primeiros 100 bytes: {r.content[:100]!r}"
+                        )
+                        break  # nao adianta tentar de novo, tenta proxima URL
+
+                    # Outros erros HTTP: nao retenta, passa pra proxima URL
+                    ultimo_erro = f"HTTP {r.status_code} em {url}"
+                    break
+
+                except requests.RequestException as e:
+                    ultimo_erro = f"{type(e).__name__}: {e}"
+                    break  # erro de rede, tenta proxima URL
+
+        if log_cb:
+            log_cb(f"    [PDF] {ultimo_erro}")
         return None
 
 
@@ -402,7 +477,9 @@ class NFSeNacionalClient:
 
 def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
                       nsu_inicial: int, baixar_pdf: bool,
-                      max_lotes: int, progress_cb) -> pd.DataFrame:
+                      max_lotes: int, progress_cb,
+                      filtrar_emitidas_rezende: bool = True,
+                      pausa_pdf: float = 1.0) -> pd.DataFrame:
     pasta_pdf = pasta_saida / "PDFs"
     pasta_xml = pasta_saida / "XMLs"
     pasta_eventos = pasta_saida / "Eventos"
@@ -413,6 +490,7 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
     manifesto = []
     nsu = nsu_inicial
     lotes = 0
+    total_descartadas = 0
 
     while lotes < max_lotes:
         url_chamada = f"{client.adn_base}/contribuintes/DFe/{nsu}"
@@ -455,6 +533,7 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
         nfse_count = 0
         evento_count = 0
         falhas_count = 0
+        descartadas_lote = 0
 
         for doc in documentos:
             nsu_doc = int(doc.get("NSU") or doc.get("nsu") or (nsu + 1))
@@ -474,6 +553,15 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
             tipo_doc = doc.get("TipoDocumento") or doc.get("tipoDocumento") or ""
             tipo_evento = doc.get("TipoEvento") or doc.get("tipoEvento") or ""
             chave_doc = doc.get("ChaveAcesso") or doc.get("chaveAcesso") or ""
+
+            # FILTRO: descarta docs onde a Rezende e a emitente da nota.
+            # A chave de acesso (50 digitos) tem o CNPJ do emitente nas pos 13-26.
+            # Isso filtra tanto notas emitidas quanto eventos vinculados a elas.
+            if filtrar_emitidas_rezende and chave_doc:
+                cnpj_emit = cnpj_emitente_da_chave(chave_doc)
+                if cnpj_emit.startswith(CNPJ_BASE_REZENDE):
+                    descartadas_lote += 1
+                    continue
 
             if not xml_b64:
                 progress_cb(f"  NSU {nsu_doc}: sem campo de XML")
@@ -513,12 +601,10 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
             try:
                 meta = parse_nfse_xml(xml_bytes)
             except ET.ParseError as e:
-                # Salva o XML cru mesmo assim na pasta "_falhas" para diagnostico
                 pasta_falhas = pasta_saida / "_falhas_parse"
                 pasta_falhas.mkdir(exist_ok=True)
                 falha_path = pasta_falhas / f"NSU-{nsu_doc:08d}.xml"
                 falha_path.write_bytes(xml_bytes)
-                # Tambem dumpa um sample binario do primeiro caso pra debug
                 if falhas_count == 0:
                     debug_path = pasta_falhas / f"NSU-{nsu_doc:08d}.raw.bin"
                     try:
@@ -527,6 +613,12 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
                         pass
                     progress_cb(f"  NSU {nsu_doc}: parse falhou ({e}). XML salvo em _falhas_parse/")
                 falhas_count += 1
+                continue
+
+            # Segundo nivel de filtro (caso o primeiro nao tenha pego por algum motivo):
+            # se o CNPJ emitente parseado for da Rezende, ainda descarta.
+            if filtrar_emitidas_rezende and meta["cnpj_emitente"].startswith(CNPJ_BASE_REZENDE):
+                descartadas_lote += 1
                 continue
 
             nome_base = montar_nome_arquivo(meta)
@@ -542,14 +634,14 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
 
             pdf_status = "-"
             if baixar_pdf and meta["chave"]:
-                pdf_bytes = client.baixar_danfse(meta["chave"])
+                pdf_bytes = client.baixar_danfse(meta["chave"], log_cb=progress_cb)
                 if pdf_bytes:
                     pdf_path = sub_pdf / f"{nome_base}.pdf"
                     pdf_path.write_bytes(pdf_bytes)
                     pdf_status = "OK"
                 else:
                     pdf_status = "falha"
-                time.sleep(0.3)
+                time.sleep(pausa_pdf)
 
             nfse_count += 1
             manifesto.append({
@@ -567,18 +659,24 @@ def executar_download(client: NFSeNacionalClient, pasta_saida: Path,
             })
 
             progress_cb(f"  NSU {nsu_doc} | {meta['data_emissao']} | "
-                       f"{meta['nome_emitente'][:35]} | R$ {meta['valor_servico']:.2f}")
+                       f"{meta['nome_emitente'][:35]} | R$ {meta['valor_servico']:.2f} | PDF: {pdf_status}")
 
         nsu = nsu_max_lote
         lotes += 1
+        total_descartadas += descartadas_lote
         progress_cb(f"  Lote {lotes}: {nfse_count} NFS-e + {evento_count} eventos + "
-                    f"{falhas_count} falhas. Proximo NSU base: {nsu}")
+                    f"{falhas_count} falhas + {descartadas_lote} descartadas (Rezende emitente). "
+                    f"Proximo NSU base: {nsu}")
 
-        time.sleep(1.5)
+        time.sleep(2.5)  # Pausa entre lotes (evita rate limit residual)
 
         if len(documentos) < 50:
             progress_cb("Ultimo lote (menos de 50 documentos).")
             break
+
+    if total_descartadas:
+        progress_cb(f"TOTAL: {total_descartadas} documento(s) descartado(s) "
+                    f"(emitidos pela Rezende, nao salvos).")
 
     return pd.DataFrame(manifesto)
 
@@ -792,6 +890,20 @@ def main():
             min_value=1, max_value=200, value=50, step=1,
         )
         baixar_pdf = st.checkbox("Baixar PDF (DANFSe) alem do XML", value=True)
+        pausa_pdf = st.slider(
+            "Pausa entre PDFs (segundos)",
+            min_value=0.3, max_value=5.0, value=1.0, step=0.1,
+            help="Tempo de espera entre downloads de PDF para evitar HTTP 429 "
+                 "(rate limit). Em pulls grandes (>500 notas), use 1.5-2.0s. "
+                 "Se mesmo assim der 429, o app faz retry automatico com backoff.",
+        )
+        filtrar_emitidas = st.checkbox(
+            "Manter apenas notas RECEBIDAS (descartar emitidas pela Rezende)",
+            value=True,
+            help="O ADN entrega tanto notas em que a Rezende e tomadora quanto "
+                 "em que e prestadora. Marcado, descarta as emitidas pela "
+                 "Rezende baseado no CNPJ embutido na chave de acesso.",
+        )
         pasta_saida_str = st.text_input(
             "Pasta de saida", value="./notas_fiscais_recebidas",
         )
@@ -909,6 +1021,8 @@ def main():
                         baixar_pdf=baixar_pdf,
                         max_lotes=int(max_lotes),
                         progress_cb=progress_cb,
+                        filtrar_emitidas_rezende=filtrar_emitidas,
+                        pausa_pdf=float(pausa_pdf),
                     )
 
                     manifesto_path = pasta_saida / "manifesto.xlsx"
